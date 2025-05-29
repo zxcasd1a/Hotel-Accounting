@@ -1,0 +1,31 @@
+fastapi
+uvicorn[standard]
+sqlalchemy
+psycopg2-binary # For production PostgreSQL, but tests might use SQLite
+pydantic[email]
+bcrypt
+passlib[bcrypt]
+python-jose[cryptography]
+pyotp
+alembic
+pydantic-settings
+python-dotenv
+sqlalchemy-utils
+greenlet
+qrcode[pil]
+
+# Testing specific dependencies
+pytest
+pytest-cov # For test coverage
+pytest-mock # For mocking
+freezegun # For time mocking in TOTP tests
+httpx # For testing FastAPI endpoints if we go that far (good for RBAC dependency test)
+ sqlalchemy[sqlite] # To ensure SQLite dialect is available for tests if using SQLite
+# Note: If using SQLite for tests, psycopg2-binary is not strictly needed for the test environment itself,
+# but it's part of the main app's dependencies.
+# For SQLAlchemy with SQLite, no separate driver installation is usually needed beyond SQLAlchemy itself
+# if the Python installation has SQLite support (which is standard).
+# `sqlalchemy[sqlite]` is added for explicitness if certain dialect features are needed.
+# However, standard SQLAlchemy should work with Python's built-in SQLite.
+# Let's remove sqlalchemy[sqlite] as it's usually not needed and can sometimes cause resolution issues.
+# SQLite is typically built into Python.

@@ -1,0 +1,1139 @@
+openapi: 3.0.3
+info:
+  title: Identity Service API
+  version: v1.0.0
+  description: API for managing tenants, users, roles, permissions, and authentication. RBAC is enforced on relevant endpoints.
+servers:
+  - url: http://localhost:8080/api/v1 # Example base path
+    description: Development server
+
+components:
+  schemas:
+    # Base Tenant Schemas
+    TenantCreate: # Renamed from TenantCreationRequest
+      type: object
+      required:
+        - name
+      properties:
+        name:
+          type: string
+          example: "New Hotel Chain"
+          minLength: 1
+        status:
+          type: string
+          enum: [Active, Suspended, Trial]
+          default: Active
+          example: Active
+    TenantUpdate: # Renamed from TenantUpdateRequest
+      type: object
+      properties:
+        name:
+          type: string
+          example: "Updated Hotel Chain Name"
+          minLength: 1
+        status:
+          type: string
+          enum: [Active, Suspended, Trial]
+          example: Suspended
+    TenantResponse: # Renamed from Tenant
+      type: object
+      properties:
+        tenantId:
+          type: string
+          format: uuid
+          readOnly: true
+        name:
+          type: string
+          example: "Hotel Example Inc."
+        status:
+          type: string
+          enum: [Active, Suspended, Trial]
+          example: Active
+        createdAt:
+          type: string
+          format: date-time
+          readOnly: true
+        updatedAt:
+          type: string
+          format: date-time
+          readOnly: true
+    PaginatedTenantResponse:
+      type: object
+      properties:
+        limit:
+          type: integer
+        offset:
+          type: integer
+        total:
+          type: integer
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/TenantResponse'
+
+    # Base User Schemas
+    UserCreate: # Renamed from UserCreationRequest
+      type: object
+      required:
+        - email
+        - password
+      properties:
+        email:
+          type: string
+          format: email
+        password:
+          type: string
+          format: password
+          writeOnly: true
+          minLength: 8
+        firstName:
+          type: string
+          nullable: true
+        lastName:
+          type: string
+          nullable: true
+        # isActive is typically set by server logic, true by default
+    UserUpdate: # Generic update, used by admin for /tenants/{tenantId}/users/{userId}
+      type: object
+      properties:
+        email:
+          type: string
+          format: email
+          nullable: true
+        firstName:
+          type: string
+          nullable: true
+        lastName:
+          type: string
+          nullable: true
+        isActive: # Admin can set this
+          type: boolean
+          nullable: true
+    UserSelfUpdate: # For PUT /users/me
+      type: object
+      properties:
+        email:
+          type: string
+          format: email
+          nullable: true
+        firstName:
+          type: string
+          nullable: true
+        lastName:
+          type: string
+          nullable: true
+    UserResponse: # Renamed from User
+      type: object
+      properties:
+        userId:
+          type: string
+          format: uuid
+          readOnly: true
+        tenantId:
+          type: string
+          format: uuid
+          readOnly: true
+        email:
+          type: string
+          format: email
+        firstName:
+          type: string
+          nullable: true
+        lastName:
+          type: string
+          nullable: true
+        isActive:
+          type: boolean
+        lastLoginAt:
+          type: string
+          format: date-time
+          nullable: true
+          readOnly: true
+        createdAt:
+          type: string
+          format: date-time
+          readOnly: true
+        updatedAt:
+          type: string
+          format: date-time
+          readOnly: true
+        roles: # Added roles to UserResponse
+          type: array
+          items:
+            $ref: '#/components/schemas/RoleResponse' # Forward reference
+          nullable: true
+          default: []
+    PaginatedUserResponse:
+      type: object
+      properties:
+        limit:
+          type: integer
+        offset:
+          type: integer
+        total:
+          type: integer
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/UserResponse'
+            
+    PasswordUpdateRequest: # Kept as is
+      type: object
+      required:
+        - currentPassword
+        - newPassword
+      properties:
+        currentPassword:
+          type: string
+          format: password
+        newPassword:
+          type: string
+          format: password
+
+    # Permission Schemas
+    PermissionBase:
+      type: object
+      required:
+        - permissionName
+      properties:
+        permissionName:
+          type: string
+          pattern: "^[a-zA-Z0-9_:]+$"
+          example: "document:read"
+        description:
+          type: string
+          nullable: true
+    PermissionCreate:
+      allOf:
+        - $ref: '#/components/schemas/PermissionBase'
+    PermissionUpdate:
+      type: object
+      properties:
+        description:
+          type: string
+          nullable: true
+    PermissionResponse:
+      allOf: # Combines PermissionBase with ID and timestamps
+        - $ref: '#/components/schemas/PermissionBase'
+        - type: object
+          properties:
+            permissionId:
+              type: string
+              format: uuid
+              readOnly: true
+            createdAt:
+              type: string
+              format: date-time
+              readOnly: true
+            updatedAt:
+              type: string
+              format: date-time
+              readOnly: true
+    PaginatedPermissionResponse:
+      type: object
+      properties:
+        limit:
+          type: integer
+        offset:
+          type: integer
+        total:
+          type: integer
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/PermissionResponse'
+
+    # Role Schemas
+    RoleBase:
+      type: object
+      required:
+        - roleName
+      properties:
+        roleName:
+          type: string
+        description:
+          type: string
+          nullable: true
+    RoleCreate: # Renamed from RoleCreationRequest
+      allOf:
+        - $ref: '#/components/schemas/RoleBase'
+        - type: object
+          properties:
+            isSystemRole: # Can be specified, or derived by service if tenantId is null
+              type: boolean
+              default: false 
+    RoleUpdate: # Renamed from RoleUpdateRequest
+      type: object
+      properties:
+        roleName:
+          type: string
+          nullable: true
+        description:
+          type: string
+          nullable: true
+    RoleResponse: # Renamed from Role
+      allOf:
+        - $ref: '#/components/schemas/RoleBase'
+        - type: object
+          properties:
+            roleId:
+              type: string
+              format: uuid
+              readOnly: true
+            tenantId:
+              type: string
+              format: uuid
+              nullable: true
+              readOnly: true
+            isSystemRole:
+              type: boolean
+              readOnly: true
+            createdAt:
+              type: string
+              format: date-time
+              readOnly: true
+            updatedAt:
+              type: string
+              format: date-time
+              readOnly: true
+            permissions: # Added permissions to RoleResponse
+              type: array
+              items:
+                $ref: '#/components/schemas/PermissionResponse'
+              nullable: true
+              default: []
+    PaginatedRoleResponse:
+      type: object
+      properties:
+        limit:
+          type: integer
+        offset:
+          type: integer
+        total:
+          type: integer
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/RoleResponse'
+
+    # Auth Schemas
+    LoginRequest: # No change needed, matches Pydantic
+      type: object
+      required:
+        - email
+        - password
+      properties:
+        email:
+          type: string
+          format: email
+        password:
+          type: string
+          format: password
+        tenantId:
+          type: string
+          format: uuid
+          nullable: true
+    TokenResponse: # Basic token response
+      type: object
+      properties:
+        accessToken:
+          type: string
+        refreshToken:
+          type: string
+        tokenType:
+          type: string
+          default: "bearer"
+    LoginSuccessResponse: # Previous LoginResponse, now more specific
+      allOf:
+        - $ref: '#/components/schemas/TokenResponse'
+        - type: object
+          properties:
+            userId:
+              type: string
+              format: uuid
+            tenantId:
+              type: string
+              format: uuid
+    TwoFactorChallengeResponse: # Indicates 2FA is next step
+      type: object
+      properties:
+        # userId: # No longer sending userId, using a temporary token
+        #   type: string
+        #   format: uuid
+        twoFactorSessionToken: # Temporary token to proceed with 2FA verification
+          type: string
+        message:
+          type: string
+          example: "Two-factor authentication required."
+    TwoFactorSessionVerificationRequest: # Renamed from TwoFactorAuthCodeRequest
+      type: object
+      required:
+        - twoFactorSessionToken
+        - code
+      properties:
+        twoFactorSessionToken:
+          type: string
+          description: "Temporary token received after successful primary authentication when 2FA is enabled."
+        code:
+          type: string
+          description: "The 6-digit TOTP code or a recovery code."
+    RefreshTokenRequest: # No change needed
+      type: object
+      required:
+        - refreshToken
+      properties:
+        refreshToken:
+          type: string
+    # AccessTokenResponse is just TokenResponse.accessToken, usually TokenResponse is returned.
+    # No need for a separate AccessTokenResponse schema if TokenResponse is used.
+
+    # 2FA Management Schemas
+    TwoFactorSetupResponse: # Updated based on Pydantic
+      type: object
+      properties:
+        qrCodeUri: # otpauth:// URI for QR code generation by frontend
+          type: string
+        # secretKey is NOT returned to client.
+        # recoveryCodes are returned upon successful enablement (verify step).
+    TwoFactorEnableRequest: # Renamed from TwoFactorVerifyRequest, for enabling 2FA
+      type: object
+      required:
+        - code
+      properties:
+        code:
+          type: string
+          description: "The 6-digit TOTP code to verify the setup and enable 2FA."
+    TwoFactorEnableResponse: # Response after enabling 2FA
+      type: object
+      properties:
+        message:
+          type: string
+          example: "2FA enabled successfully."
+        recoveryCodes:
+          type: array
+          items:
+            type: string
+          description: "List of single-use recovery codes. Save these securely."
+    RecoveryCodesResponse: # Renamed from TwoFactorRecoveryCodesResponse
+      type: object
+      properties:
+        recoveryCodes:
+          type: array
+          items:
+            type: string
+          description: "A list of newly generated single-use recovery codes."
+    TwoFactorAuthStatusResponse: # New schema
+      type: object
+      properties:
+        userId:
+          type: string
+          format: uuid
+        isEnabled:
+          type: boolean
+
+    # Assignment Schemas
+    RolePermissionAssignmentRequest: # No change needed
+      type: object
+      required:
+        - permissionId
+      properties:
+        permissionId:
+          type: string
+          format: uuid
+    UserRoleAssignmentRequest: # No change needed
+      type: object
+      required:
+        - roleId
+      properties:
+        roleId:
+          type: string
+          format: uuid
+
+    # Error Schema
+    ErrorResponse: # No change needed
+      type: object
+      properties:
+        message:
+          type: string
+        code: 
+          type: string
+          nullable: true
+
+  parameters: # No changes expected here based on current scope
+    TenantIdPath:
+      name: tenantId
+      in: path
+      required: true
+      description: Identifier of the Tenant
+      schema:
+        type: string
+        format: uuid
+    UserIdPath:
+      name: userId
+      in: path
+      required: true
+      description: Identifier of the User
+      schema:
+        type: string
+        format: uuid
+    RoleIdPath:
+      name: roleId
+      in: path
+      required: true
+      description: Identifier of the Role
+      schema:
+        type: string
+        format: uuid
+    PermissionIdPath:
+      name: permissionId
+      in: path
+      required: true
+      description: Identifier of the Permission
+      schema:
+        type: string
+        format: uuid
+    LimitQuery:
+      name: limit
+      in: query
+      description: Maximum number of records to return
+      schema:
+        type: integer
+        format: int32
+        default: 20
+    OffsetQuery:
+      name: offset
+      in: query
+      description: Number of records to skip for pagination
+      schema:
+        type: integer
+        format: int32
+        default: 0
+
+  securitySchemes:
+    BearerAuth: # No change needed
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+
+responses: # Common responses, no changes needed
+  UnauthorizedError:
+    description: Authentication information is missing or invalid.
+    content:
+      application/json:
+        schema:
+          $ref: '#/components/schemas/ErrorResponse'
+  ForbiddenError:
+    description: Authenticated user does not have permission to perform this action.
+    content:
+      application/json:
+        schema:
+          $ref: '#/components/schemas/ErrorResponse'
+  NotFoundError:
+    description: The requested resource was not found.
+    content:
+      application/json:
+        schema:
+          $ref: '#/components/schemas/ErrorResponse'
+  BadRequestError:
+    description: The request payload is invalid or malformed.
+    content:
+      application/json:
+        schema:
+          $ref: '#/components/schemas/ErrorResponse'
+
+security: # Global security, no change
+  - BearerAuth: []
+
+paths:
+  # Tenant Management
+  /tenants:
+    post:
+      summary: Create a new Tenant (System Admin)
+      tags: [Tenant Management]
+      # security: [{"BearerAuth": ["tenant:create"]}] # Example specific scope
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/TenantCreate' # Updated
+      responses:
+        '201':
+          description: Tenant created successfully
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TenantResponse' # Updated
+        # ... other error responses
+    get:
+      summary: List all Tenants (System Admin)
+      tags: [Tenant Management]
+      parameters:
+        - $ref: '#/components/parameters/LimitQuery'
+        - $ref: '#/components/parameters/OffsetQuery'
+      responses:
+        '200':
+          description: A list of Tenants
+          content:
+            application/json:
+              schema: # Updated to use PaginatedTenantResponse
+                $ref: '#/components/schemas/PaginatedTenantResponse'
+        # ... other error responses
+
+  /tenants/{tenantId}:
+    parameters:
+      - $ref: '#/components/parameters/TenantIdPath'
+    get:
+      summary: Get Tenant details
+      tags: [Tenant Management]
+      responses:
+        '200':
+          description: Tenant details
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TenantResponse' # Updated
+        # ... other error responses
+    put:
+      summary: Update Tenant details
+      tags: [Tenant Management]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/TenantUpdate' # Updated
+      responses:
+        '200':
+          description: Tenant updated successfully
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TenantResponse' # Updated
+        # ... other error responses
+
+  # User Lifecycle Management
+  /tenants/{tenantId}/users:
+    parameters:
+      - $ref: '#/components/parameters/TenantIdPath'
+    post:
+      summary: Create a new User within a Tenant
+      tags: [User Management]
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/UserCreate' # Updated
+      responses:
+        '201':
+          description: User created successfully
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/UserResponse' # Updated
+        # ... other error responses
+    get:
+      summary: List Users within a Tenant
+      tags: [User Management]
+      parameters:
+        - $ref: '#/components/parameters/LimitQuery'
+        - $ref: '#/components/parameters/OffsetQuery'
+      responses:
+        '200':
+          description: A list of Users in the tenant
+          content:
+            application/json:
+              schema: # Updated to use PaginatedUserResponse
+                $ref: '#/components/schemas/PaginatedUserResponse'
+        # ... other error responses
+
+  /tenants/{tenantId}/users/{userId}:
+    parameters:
+      - $ref: '#/components/parameters/TenantIdPath'
+      - $ref: '#/components/parameters/UserIdPath'
+    get:
+      summary: Get User details
+      tags: [User Management]
+      responses:
+        '200':
+          description: User details
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/UserResponse' # Updated
+        # ... other error responses
+    put: # Admin updating user details
+      summary: Update User details (Admin)
+      tags: [User Management]
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/UserUpdate' # Updated (generic, admin can update isActive)
+      responses:
+        '200':
+          description: User updated successfully
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/UserResponse' # Updated
+        # ... other error responses
+    delete:
+      summary: Deactivate or Delete a User (Admin)
+      tags: [User Management]
+      responses:
+        '204':
+          description: User deactivated/deleted successfully
+        # ... other error responses
+
+  /users/me:
+    get:
+      summary: Get current authenticated User's profile
+      tags: [User Management]
+      responses:
+        '200':
+          description: Current User's details
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/UserResponse' # Updated (will include roles)
+        # ... other error responses
+    put:
+      summary: Update current authenticated User's profile
+      tags: [User Management]
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/UserSelfUpdate' # Specific schema for self-update
+      responses:
+        '200':
+          description: User profile updated successfully
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/UserResponse'
+        # ... other error responses
+
+  # Authentication
+  /auth/login:
+    post:
+      summary: Log in a User (Password Grant)
+      description: Authenticates a user with email and password. If 2FA is enabled, returns a temporary session token for the 2FA step. Otherwise, returns access and refresh tokens.
+      tags: [Authentication]
+      security: [] 
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/LoginRequest'
+      responses:
+        '200': # Can be either final tokens or 2FA challenge
+          description: Authentication successful. May require 2FA step.
+          content:
+            application/json:
+              schema:
+                oneOf:
+                  - $ref: '#/components/schemas/LoginSuccessResponse' # Final tokens
+                  - $ref: '#/components/schemas/TwoFactorChallengeResponse' # 2FA required
+        # ... other error responses (400, 401 for invalid creds, 404 for tenant)
+
+  /auth/login/2fa:
+    post:
+      summary: Submit 2FA code (TOTP or Recovery)
+      description: Verifies a 2FA code (TOTP or recovery) using a temporary session token received after successful primary authentication. Returns final access and refresh tokens upon success.
+      tags: [Authentication]
+      security: []
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/TwoFactorSessionVerificationRequest' # Updated
+      responses:
+        '200':
+          description: 2FA verification successful, tokens issued.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/LoginSuccessResponse' # Final tokens
+        # ... other error responses (400, 401 for invalid code/token)
+
+  /auth/refresh:
+    post:
+      summary: Refresh access token
+      tags: [Authentication]
+      security: [] 
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/RefreshTokenRequest'
+      responses:
+        '200':
+          description: Access token refreshed successfully.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TokenResponse' # Returns new tokens
+        # ... other error responses (401 for invalid refresh token)
+
+  /auth/logout:
+    post:
+      summary: Log out User (Invalidate Tokens - if applicable)
+      description: Optional. In a stateless JWT setup, client discards tokens. If refresh tokens are managed server-side (e.g., revocation list), this endpoint would invalidate it.
+      tags: [Authentication]
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/RefreshTokenRequest' # Client might send refresh token to invalidate
+      responses:
+        '204':
+          description: Logout successful or tokens cleared by client.
+        # ... other error responses
+
+  # 2FA Management for current user (/users/me/2fa/...)
+  /users/me/2fa/setup:
+    post:
+      summary: Initiate 2FA setup for current user
+      description: Generates a new TOTP secret and returns a QR code URI for the user to scan with their authenticator app. The 2FA is not yet enabled.
+      tags: [Two-Factor Authentication]
+      responses:
+        '200':
+          description: 2FA setup initiated. Scan QR code and verify.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TwoFactorSetupResponse' # Updated (qrCodeUri only)
+        # ... other error responses (401, 409 if already enabled/setup initiated)
+  
+  /users/me/2fa/enable: # Changed from /verify to /enable for clarity of action
+    post:
+      summary: Verify TOTP and Enable 2FA for current user
+      description: User submits a TOTP code from their authenticator app to verify the setup and enable 2FA. Returns recovery codes upon successful enablement.
+      tags: [Two-Factor Authentication]
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/TwoFactorEnableRequest' # Updated
+      responses:
+        '200':
+          description: 2FA enabled successfully. Recovery codes provided.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TwoFactorEnableResponse' # Includes recovery codes
+        # ... other error responses (400 for invalid code, 401)
+
+  /users/me/2fa: # GET to check status, DELETE to disable
+    get:
+      summary: Check 2FA status for current user
+      tags: [Two-Factor Authentication]
+      responses:
+        '200':
+          description: Returns current 2FA status.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TwoFactorAuthStatusResponse'
+        # ... other error responses
+    delete:
+      summary: Disable 2FA for current user
+      description: Disables two-factor authentication. May require password re-verification for security.
+      tags: [Two-Factor Authentication]
+      # Optional requestBody for password re-verification
+      responses:
+        '204':
+          description: 2FA disabled successfully.
+        # ... other error responses (401, 403 if not enabled)
+
+  /users/me/2fa/recovery-codes:
+    get: # Changed to POST for generating new codes (action-oriented)
+      summary: Generate new 2FA recovery codes for current user
+      description: Generates and returns a new set of recovery codes, invalidating any previous ones. 2FA must be enabled.
+      tags: [Two-Factor Authentication]
+      responses:
+        '200':
+          description: New recovery codes generated.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RecoveryCodesResponse' # Updated
+        # ... other error responses (401, 403 if 2FA not enabled)
+
+  # Permission Management (Primarily for System Admins)
+  /permissions:
+    summary: Manage system-wide permissions.
+    get:
+      summary: List all Permissions
+      tags: [Permission Management]
+      parameters:
+        - $ref: '#/components/parameters/LimitQuery'
+        - $ref: '#/components/parameters/OffsetQuery'
+      responses:
+        '200':
+          description: A list of all available permissions.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PaginatedPermissionResponse' # Updated
+        # ... other error responses
+    post:
+      summary: Create a new Permission (System Admin)
+      tags: [Permission Management]
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/PermissionCreate'
+      responses:
+        '201':
+          description: Permission created successfully.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PermissionResponse'
+        # ... other error responses
+
+  /permissions/{permissionId}:
+    parameters:
+      - $ref: '#/components/parameters/PermissionIdPath'
+    get:
+      summary: Get Permission details
+      tags: [Permission Management]
+      responses:
+        '200':
+          description: Details of the permission.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PermissionResponse'
+        # ... other error responses
+    put:
+      summary: Update Permission details (System Admin)
+      tags: [Permission Management]
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/PermissionUpdate'
+      responses:
+        '200':
+          description: Permission updated successfully.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PermissionResponse'
+        # ... other error responses
+    delete:
+      summary: Delete a Permission (System Admin)
+      description: Deletes a permission if it's not currently assigned to any roles.
+      tags: [Permission Management]
+      responses:
+        '204':
+          description: Permission deleted successfully.
+        # ... other error responses (404, 409 if in use)
+
+  # Role Management
+  # System Roles
+  /roles/system:
+    get:
+      summary: List all system-level Roles
+      tags: [Role Management]
+      parameters:
+        - $ref: '#/components/parameters/LimitQuery'
+        - $ref: '#/components/parameters/OffsetQuery'
+      responses:
+        '200':
+          description: A list of system Roles.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PaginatedRoleResponse' # Updated
+        # ... other error responses
+    post:
+      summary: Create a new system Role (System Admin)
+      tags: [Role Management]
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/RoleCreate' # isSystemRole should be true, tenantId null
+      responses:
+        '201':
+          description: System role created.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RoleResponse'
+        # ... other error responses
+        
+  # Tenant Roles
+  /tenants/{tenantId}/roles:
+    parameters:
+      - $ref: '#/components/parameters/TenantIdPath'
+    get:
+      summary: List Roles for a Tenant (includes system roles by default or via query param)
+      tags: [Role Management]
+      parameters:
+        - $ref: '#/components/parameters/LimitQuery'
+        - $ref: '#/components/parameters/OffsetQuery'
+        - name: includeSystemRoles
+          in: query
+          schema:
+            type: boolean
+            default: false # Or true, depending on desired default
+          required: false
+          description: Whether to include system-level roles in the listing for this tenant.
+      responses:
+        '200':
+          description: A list of Roles for the tenant.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PaginatedRoleResponse' # Updated
+        # ... other error responses
+    post:
+      summary: Create a new Role within a Tenant
+      tags: [Role Management]
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/RoleCreate' # isSystemRole should be false
+      responses:
+        '201':
+          description: Tenant-specific role created.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RoleResponse'
+        # ... other error responses
+
+  # Common Role Operations (apply to system or tenant roles via path)
+  # Path could be /roles/{roleId} for system roles
+  # and /tenants/{tenantId}/roles/{roleId} for tenant roles.
+  # For simplicity, existing paths for tenant roles are kept. System role management might be separate.
+  # The current /tenants/{tenantId}/roles/{roleId} implies tenant-specific.
+  # Let's refine this for clarity:
+
+  /roles/{roleId}: # For managing a specific role, could be system or tenant if path is adapted
+                   # Or keep separate paths for system roles vs tenant roles.
+                   # Current YAML uses /tenants/{tenantId}/roles/{roleId} for tenant roles.
+                   # And /roles/system for listing system roles.
+                   # Let's assume management of individual system roles might also use /roles/{roleId}
+                   # or be handled via a different admin interface/tool.
+                   # For now, I'll focus on updating existing role paths.
+    parameters:
+      - $ref: '#/components/parameters/RoleIdPath' # This is generic.
+    # GET, PUT, DELETE for a role (system or tenant, context from path/service logic)
+    # This section might need more specific paths like /system/roles/{roleId} if shared /roles/{roleId} is ambiguous.
+    # For now, updating the tenant-specific one:
+    # Path already exists: /tenants/{tenantId}/roles/{roleId}
+    # This path is fine, it clearly scopes to tenant.
+
+  # Role-Permission Assignment (for tenant roles)
+  /tenants/{tenantId}/roles/{roleId}/permissions:
+    parameters:
+      - $ref: '#/components/parameters/TenantIdPath'
+      - $ref: '#/components/parameters/RoleIdPath'
+    get:
+      summary: List Permissions assigned to a Role
+      tags: [Role-Permission Assignment]
+      responses:
+        '200':
+          description: List of Permissions for the Role.
+          content:
+            application/json:
+              schema: # Should be an array of PermissionResponse, not paginated usually
+                type: array
+                items:
+                  $ref: '#/components/schemas/PermissionResponse' 
+        # ... other error responses
+    post:
+      summary: Assign a Permission to a Role
+      tags: [Role-Permission Assignment]
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/RolePermissionAssignmentRequest'
+      responses:
+        '200': # Changed from 201 to 200, often returns the updated role or just success
+          description: Permission assigned successfully. Returns the updated role.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RoleResponse' # Return updated role
+        # ... other error responses
+
+  /tenants/{tenantId}/roles/{roleId}/permissions/{permissionId}:
+    parameters:
+      - $ref: '#/components/parameters/TenantIdPath'
+      - $ref: '#/components/parameters/RoleIdPath'
+      - $ref: '#/components/parameters/PermissionIdPath'
+    delete:
+      summary: Remove a Permission from a Role
+      tags: [Role-Permission Assignment]
+      responses:
+        '200': # Changed from 204, can return the updated role.
+          description: Permission removed successfully. Returns the updated role.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RoleResponse'
+        # ... other error responses (404 if any ID not found)
+
+  # User-Role Assignment
+  /tenants/{tenantId}/users/{userId}/roles:
+    parameters:
+      - $ref: '#/components/parameters/TenantIdPath'
+      - $ref: '#/components/parameters/UserIdPath'
+    get:
+      summary: List Roles assigned to a User
+      tags: [User-Role Assignment]
+      responses:
+        '200':
+          description: List of Roles for the User.
+          content:
+            application/json:
+              schema: # Array of RoleResponse, not paginated usually for this context
+                type: array
+                items:
+                  $ref: '#/components/schemas/RoleResponse'
+        # ... other error responses
+    post:
+      summary: Assign a Role to a User
+      tags: [User-Role Assignment]
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/UserRoleAssignmentRequest'
+      responses:
+        '200': # Changed from 201, can return the updated user or list of user's roles
+          description: Role assigned successfully. Returns the updated user.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/UserResponse' # Return updated user (with new roles list)
+        # ... other error responses
+
+  /tenants/{tenantId}/users/{userId}/roles/{roleId}:
+    parameters:
+      - $ref: '#/components/parameters/TenantIdPath'
+      - $ref: '#/components/parameters/UserIdPath'
+      - $ref: '#/components/parameters/RoleIdPath'
+    delete:
+      summary: Remove a Role from a User
+      tags: [User-Role Assignment]
+      responses:
+        '200': # Changed from 204, can return updated user
+          description: Role removed successfully. Returns the updated user.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/UserResponse'
+        # ... other error responses
+```
