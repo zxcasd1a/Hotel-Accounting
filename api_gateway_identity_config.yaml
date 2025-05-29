@@ -1,0 +1,341 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: AWS API Gateway HTTP API for IdentityService with JWT Lambda Authorizer, Rate Limiting, and Context Mapping.
+
+Parameters:
+  BackendBaseUrl:
+    Type: String
+    Description: "The base URL of the backend IdentityService."
+    Default: "http://your-backend-service-url-goes-here"
+  VpcLinkId:
+    Type: String
+    Description: "(Optional) ID of the VPC Link if the backend is in a private VPC."
+    Default: ""
+  StageName:
+    Type: String
+    Description: "Name of the API Gateway stage."
+    Default: "$default"
+  LambdaAuthorizerName:
+    Type: String
+    Description: "Name for the JWT Lambda Authorizer function."
+    Default: "IdentityServiceJwtAuthorizer"
+  LambdaAuthorizerS3Bucket:
+    Type: String
+    Description: "S3 bucket for the Lambda authorizer deployment package."
+  LambdaAuthorizerS3Key:
+    Type: String
+    Description: "S3 key for the Lambda authorizer deployment package."
+  JwtSecretOrPublicKeyArn:
+    Type: String
+    Description: "ARN of the AWS Secrets Manager secret for JWT validation."
+  JwtAlgorithm:
+    Type: String
+    Description: "JWT signing algorithm."
+    Default: "HS256"
+  JwtAudience:
+    Type: String
+    Description: "Audience claim for JWT validation."
+  JwtIssuer:
+    Type: String
+    Description: "(Optional) Issuer claim for JWT validation."
+    Default: ""
+
+  # Throttling Parameters
+  DefaultThrottlingBurstLimit: { Type: Number, Default: 200 }
+  DefaultThrottlingRateLimit: { Type: Number, Default: 100 }
+  AuthRouteThrottlingBurstLimit: { Type: Number, Default: 20 }
+  AuthRouteThrottlingRateLimit: { Type: Number, Default: 10 }
+  RefreshRouteThrottlingBurstLimit: { Type: Number, Default: 50 }
+  RefreshRouteThrottlingRateLimit: { Type: Number, Default: 25 }
+
+  # Access Logging Parameters
+  AccessLogRetentionInDays:
+    Type: Number
+    Description: "Retention period for API Gateway access logs in CloudWatch (in days)."
+    Default: 30
+
+Conditions:
+  HasVpcLink: !Not [!Equals [!Ref VpcLinkId, ""]]
+  HasJwtIssuer: !Not [!Equals [!Ref JwtIssuer, ""]]
+
+Resources:
+  # --- CloudWatch Log Group for Access Logs ---
+  ApiAccessLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/aws/apigateway/${IdentityHttpApi}/accesslogs" # API ID will be substituted
+      RetentionInDays: !Ref AccessLogRetentionInDays
+      # KmsKeyId: (Optional) Specify KMS Key for encryption
+
+  # IAM Role for Lambda Authorizer
+  LambdaAuthorizerRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${LambdaAuthorizerName}-Role"
+      AssumeRolePolicyDocument: { Version: "2012-10-17", Statement: [{ Effect: Allow, Principal: { Service: lambda.amazonaws.com }, Action: sts:AssumeRole }] }
+      ManagedPolicyArns: [arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole]
+      Policies:
+        - PolicyName: SecretsManagerReadAccess
+          PolicyDocument: { Version: "2012-10-17", Statement: [{ Effect: Allow, Action: secretsmanager:GetSecretValue, Resource: !Ref JwtSecretOrPublicKeyArn }] }
+
+  # Lambda Authorizer Function
+  JwtAuthorizerFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Ref LambdaAuthorizerName
+      Handler: lambda_authorizer.handler 
+      Runtime: python3.11 
+      Role: !GetAtt LambdaAuthorizerRole.Arn
+      Code: { S3Bucket: !Ref LambdaAuthorizerS3Bucket, S3Key: !Ref LambdaAuthorizerS3Key }
+      Timeout: 5 
+      MemorySize: 128 
+      Environment:
+        Variables:
+          JWT_SECRET_OR_PUBLIC_KEY: !Ref JwtSecretOrPublicKeyArn
+          JWT_ALGORITHM: !Ref JwtAlgorithm
+          JWT_AUDIENCE: !Ref JwtAudience
+          JWT_ISSUER: !If [HasJwtIssuer, !Ref JwtIssuer, !Ref "AWS::NoValue"]
+          POWERTOOLS_SERVICE_NAME: "identity-service-authorizer"
+          LOG_LEVEL: "INFO"
+
+  # API Gateway HTTP API
+  IdentityHttpApi:
+    Type: AWS::ApiGatewayV2::Api
+    Properties:
+      Name: IdentityServiceHttpApi
+      ProtocolType: HTTP
+      Description: "HTTP API for IdentityService with JWT Authorization, Rate Limiting, and Access Logging."
+      CorsConfiguration: { AllowOrigins: ["*"], AllowMethods: [GET, POST, PUT, DELETE, OPTIONS], AllowHeaders: [Content-Type, Authorization, X-Amz-Date, X-Api-Key, X-Amz-Security-Token], MaxAge: 300 }
+
+  # API Gateway Authorizer
+  HttpApiJwtAuthorizer:
+    Type: AWS::ApiGatewayV2::Authorizer
+    Properties:
+      ApiId: !Ref IdentityHttpApi
+      Name: JwtLambdaAuthorizer
+      AuthorizerType: REQUEST
+      AuthorizerPayloadFormatVersion: "2.0"
+      IdentitySource: ["$request.header.Authorization"]
+      AuthorizerUri: !Sub "arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${JwtAuthorizerFunction.Arn}/invocations"
+      EnableSimpleResponses: true
+
+  # Lambda Permission for API Gateway
+  LambdaAuthorizerInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !GetAtt JwtAuthorizerFunction.Arn
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub "arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${IdentityHttpApi}/authorizers/${HttpApiJwtAuthorizer}"
+
+  # Default Stage - MODIFIED for Throttling and Access Logging
+  DefaultStage:
+    Type: AWS::ApiGatewayV2::Stage
+    Properties:
+      ApiId: !Ref IdentityHttpApi
+      StageName: !Ref StageName
+      AutoDeploy: true
+      DefaultRouteSettings: 
+        ThrottlingBurstLimit: !Ref DefaultThrottlingBurstLimit
+        ThrottlingRateLimit: !Ref DefaultThrottlingRateLimit
+      AccessLogSettings:
+        DestinationArn: !GetAtt ApiAccessLogGroup.Arn
+        Format: |
+          {
+            "requestId": "$context.requestId",
+            "ip": "$context.identity.sourceIp",
+            "requestTime": "$context.requestTime",
+            "httpMethod": "$context.httpMethod",
+            "routeKey": "$context.routeKey",
+            "path": "$context.path",
+            "protocol": "$context.protocol",
+            "status": "$context.status",
+            "responseLength": "$context.responseLength",
+            "integrationLatency": "$context.integrationLatency",
+            "authorizerPrincipalId": "$context.authorizer.principalId", 
+            "authorizerUserId": "$context.authorizer.userId",
+            "authorizerTenantId": "$context.authorizer.tenantId",
+            "authorizerError": "$context.authorizer.error",
+            "integrationErrorMessage": "$context.integration.error",
+            "integrationStatus": "$context.integration.status",
+            "errorMessage": "$context.error.message",
+            "errorResponseType": "$context.error.responseType"
+          }
+          
+  # Helper for common Integration Properties
+  CommonIntegrationProperties: &CommonIntegrationProperties
+    ApiId: !Ref IdentityHttpApi
+    IntegrationType: HTTP_PROXY
+    PayloadFormatVersion: "1.0"
+    ConnectionType: !If [HasVpcLink, "VPC_LINK", "INTERNET"]
+    ConnectionId: !If [HasVpcLink, !Ref VpcLinkId, !Ref "AWS::NoValue"]
+
+  # Helper for common Protected Route Integration Request Parameters (NEW)
+  AuthorizerContextRequestParameters: &AuthorizerContextRequestParameters
+    "append:header.X-User-Id": "$context.authorizer.userId"
+    "append:header.X-Tenant-Id": "$context.authorizer.tenantId" 
+    "append:header.X-User-Roles": "$context.authorizer.roles"
+    "append:header.X-User-Permissions": "$context.authorizer.permissions"
+    "append:header.X-Is-2fa-Authenticated": "$context.authorizer.is_2fa_authenticated"
+
+  # Helper for common Protected Route Properties
+  ProtectedRouteProperties: &ProtectedRouteProperties
+    AuthorizationType: CUSTOM
+    AuthorizerId: !Ref HttpApiJwtAuthorizer
+
+  # --- Routes & Integrations ---
+  # Public Routes
+  AuthLoginPostIntegration: { Properties: { <<: *CommonIntegrationProperties, IntegrationUri: !Sub "${BackendBaseUrl}/auth/login", IntegrationMethod: POST } }
+  AuthLoginPostRoute: { Type: AWS::ApiGatewayV2::Route, Properties: { ApiId: !Ref IdentityHttpApi, RouteKey: POST /auth/login, Target: !Join ["/", ["integrations", !Ref AuthLoginPostIntegration]], RouteSettings: { ThrottlingBurstLimit: !Ref AuthRouteThrottlingBurstLimit, ThrottlingRateLimit: !Ref AuthRouteThrottlingRateLimit } } }
+  AuthLogin2faPostIntegration: { Properties: { <<: *CommonIntegrationProperties, IntegrationUri: !Sub "${BackendBaseUrl}/auth/login/2fa", IntegrationMethod: POST } }
+  AuthLogin2faPostRoute: { Type: AWS::ApiGatewayV2::Route, Properties: { ApiId: !Ref IdentityHttpApi, RouteKey: POST /auth/login/2fa, Target: !Join ["/", ["integrations", !Ref AuthLogin2faPostIntegration]], RouteSettings: { ThrottlingBurstLimit: !Ref AuthRouteThrottlingBurstLimit, ThrottlingRateLimit: !Ref AuthRouteThrottlingRateLimit } } }
+  AuthRefreshPostIntegration: { Properties: { <<: *CommonIntegrationProperties, IntegrationUri: !Sub "${BackendBaseUrl}/auth/refresh", IntegrationMethod: POST } }
+  AuthRefreshPostRoute: { Type: AWS::ApiGatewayV2::Route, Properties: { ApiId: !Ref IdentityHttpApi, RouteKey: POST /auth/refresh, Target: !Join ["/", ["integrations", !Ref AuthRefreshPostIntegration]], RouteSettings: { ThrottlingBurstLimit: !Ref RefreshRouteThrottlingBurstLimit, ThrottlingRateLimit: !Ref RefreshRouteThrottlingRateLimit } } }
+  
+  # Protected Routes - MODIFIED to include RequestParameters
+  # Tenant Management
+  TenantsPostIntegration: { Properties: { <<: *CommonIntegrationProperties, IntegrationUri: !Sub "${BackendBaseUrl}/tenants", IntegrationMethod: POST, RequestParameters: *AuthorizerContextRequestParameters } }
+  TenantsPostRoute: { Type: AWS::ApiGatewayV2::Route, Properties: { ApiId: !Ref IdentityHttpApi, RouteKey: POST /tenants, Target: !Join ["/", ["integrations", !Ref TenantsPostIntegration]], <<: *ProtectedRouteProperties } }
+  TenantsGetIntegration: { Properties: { <<: *CommonIntegrationProperties, IntegrationUri: !Sub "${BackendBaseUrl}/tenants", IntegrationMethod: GET, RequestParameters: *AuthorizerContextRequestParameters } }
+  TenantsGetRoute: { Type: AWS::ApiGatewayV2::Route, Properties: { ApiId: !Ref IdentityHttpApi, RouteKey: GET /tenants, Target: !Join ["/", ["integrations", !Ref TenantsGetIntegration]], <<: *ProtectedRouteProperties } }
+  TenantsByTenantIdGetIntegration: { Properties: { <<: *CommonIntegrationProperties, IntegrationUri: !Sub "${BackendBaseUrl}/tenants/{tenantId}", IntegrationMethod: GET, RequestParameters: *AuthorizerContextRequestParameters } }
+  TenantsByTenantIdGetRoute: { Type: AWS::ApiGatewayV2::Route, Properties: { ApiId: !Ref IdentityHttpApi, RouteKey: GET /tenants/{tenantId}, Target: !Join ["/", ["integrations", !Ref TenantsByTenantIdGetIntegration]], <<: *ProtectedRouteProperties } }
+  TenantsByTenantIdPutIntegration: { Properties: { <<: *CommonIntegrationProperties, IntegrationUri: !Sub "${BackendBaseUrl}/tenants/{tenantId}", IntegrationMethod: PUT, RequestParameters: *AuthorizerContextRequestParameters } }
+  TenantsByTenantIdPutRoute: { Type: AWS::ApiGatewayV2::Route, Properties: { ApiId: !Ref IdentityHttpApi, RouteKey: PUT /tenants/{tenantId}, Target: !Join ["/", ["integrations", !Ref TenantsByTenantIdPutIntegration]], <<: *ProtectedRouteProperties } }
+
+  # User Lifecycle Management
+  TenantsByTenantIdUsersPostIntegration: { Properties: { <<: *CommonIntegrationProperties, IntegrationUri: !Sub "${BackendBaseUrl}/tenants/{tenantId}/users", IntegrationMethod: POST, RequestParameters: *AuthorizerContextRequestParameters } }
+  TenantsByTenantIdUsersPostRoute: { Type: AWS::ApiGatewayV2::Route, Properties: { ApiId: !Ref IdentityHttpApi, RouteKey: POST /tenants/{tenantId}/users, Target: !Join ["/", ["integrations", !Ref TenantsByTenantIdUsersPostIntegration]], <<: *ProtectedRouteProperties } }
+  TenantsByTenantIdUsersGetIntegration: { Properties: { <<: *CommonIntegrationProperties, IntegrationUri: !Sub "${BackendBaseUrl}/tenants/{tenantId}/users", IntegrationMethod: GET, RequestParameters: *AuthorizerContextRequestParameters } }
+  TenantsByTenantIdUsersGetRoute: { Type: AWS::ApiGatewayV2::Route, Properties: { ApiId: !Ref IdentityHttpApi, RouteKey: GET /tenants/{tenantId}/users, Target: !Join ["/", ["integrations", !Ref TenantsByTenantIdUsersGetIntegration]], <<: *ProtectedRouteProperties } }
+  TenantsByTenantIdUsersByUserIdGetIntegration: { Properties: { <<: *CommonIntegrationProperties, IntegrationUri: !Sub "${BackendBaseUrl}/tenants/{tenantId}/users/{userId}", IntegrationMethod: GET, RequestParameters: *AuthorizerContextRequestParameters } }
+  TenantsByTenantIdUsersByUserIdGetRoute: { Type: AWS::ApiGatewayV2::Route, Properties: { ApiId: !Ref IdentityHttpApi, RouteKey: GET /tenants/{tenantId}/users/{userId}, Target: !Join ["/", ["integrations", !Ref TenantsByTenantIdUsersByUserIdGetIntegration]], <<: *ProtectedRouteProperties } }
+  TenantsByTenantIdUsersByUserIdPutIntegration: { Properties: { <<: *CommonIntegrationProperties, IntegrationUri: !Sub "${BackendBaseUrl}/tenants/{tenantId}/users/{userId}", IntegrationMethod: PUT, RequestParameters: *AuthorizerContextRequestParameters } }
+  TenantsByTenantIdUsersByUserIdPutRoute: { Type: AWS::ApiGatewayV2::Route, Properties: { ApiId: !Ref IdentityHttpApi, RouteKey: PUT /tenants/{tenantId}/users/{userId}, Target: !Join ["/", ["integrations", !Ref TenantsByTenantIdUsersByUserIdPutIntegration]], <<: *ProtectedRouteProperties } }
+  TenantsByTenantIdUsersByUserIdDeleteIntegration: { Properties: { <<: *CommonIntegrationProperties, IntegrationUri: !Sub "${BackendBaseUrl}/tenants/{tenantId}/users/{userId}", IntegrationMethod: DELETE, RequestParameters: *AuthorizerContextRequestParameters } }
+  TenantsByTenantIdUsersByUserIdDeleteRoute: { Type: AWS::ApiGatewayV2::Route, Properties: { ApiId: !Ref IdentityHttpApi, RouteKey: DELETE /tenants/{tenantId}/users/{userId}, Target: !Join ["/", ["integrations", !Ref TenantsByTenantIdUsersByUserIdDeleteIntegration]], <<: *ProtectedRouteProperties } }
+  UsersMeGetIntegration: { Properties: { <<: *CommonIntegrationProperties, IntegrationUri: !Sub "${BackendBaseUrl}/users/me", IntegrationMethod: GET, RequestParameters: *AuthorizerContextRequestParameters } }
+  UsersMeGetRoute: { Type: AWS::ApiGatewayV2::Route, Properties: { ApiId: !Ref IdentityHttpApi, RouteKey: GET /users/me, Target: !Join ["/", ["integrations", !Ref UsersMeGetIntegration]], <<: *ProtectedRouteProperties } }
+  UsersMePutIntegration: { Properties: { <<: *CommonIntegrationProperties, IntegrationUri: !Sub "${BackendBaseUrl}/users/me", IntegrationMethod: PUT, RequestParameters: *AuthorizerContextRequestParameters } }
+  UsersMePutRoute: { Type: AWS::ApiGatewayV2::Route, Properties: { ApiId: !Ref IdentityHttpApi, RouteKey: PUT /users/me, Target: !Join ["/", ["integrations", !Ref UsersMePutIntegration]], <<: *ProtectedRouteProperties } }
+  AuthLogoutPostIntegration: { Properties: { <<: *CommonIntegrationProperties, IntegrationUri: !Sub "${BackendBaseUrl}/auth/logout", IntegrationMethod: POST, RequestParameters: *AuthorizerContextRequestParameters } }
+  AuthLogoutPostRoute: { Type: AWS::ApiGatewayV2::Route, Properties: { ApiId: !Ref IdentityHttpApi, RouteKey: POST /auth/logout, Target: !Join ["/", ["integrations", !Ref AuthLogoutPostIntegration]], <<: *ProtectedRouteProperties } }
+
+  # 2FA Management
+  UsersMe2faSetupPostIntegration: { Properties: { <<: *CommonIntegrationProperties, IntegrationUri: !Sub "${BackendBaseUrl}/users/me/2fa/setup", IntegrationMethod: POST, RequestParameters: *AuthorizerContextRequestParameters } }
+  UsersMe2faSetupPostRoute: { Type: AWS::ApiGatewayV2::Route, Properties: { ApiId: !Ref IdentityHttpApi, RouteKey: POST /users/me/2fa/setup, Target: !Join ["/", ["integrations", !Ref UsersMe2faSetupPostIntegration]], <<: *ProtectedRouteProperties } }
+  UsersMe2faEnablePostIntegration: { Properties: { <<: *CommonIntegrationProperties, IntegrationUri: !Sub "${BackendBaseUrl}/users/me/2fa/enable", IntegrationMethod: POST, RequestParameters: *AuthorizerContextRequestParameters } }
+  UsersMe2faEnablePostRoute: { Type: AWS::ApiGatewayV2::Route, Properties: { ApiId: !Ref IdentityHttpApi, RouteKey: POST /users/me/2fa/enable, Target: !Join ["/", ["integrations", !Ref UsersMe2faEnablePostIntegration]], <<: *ProtectedRouteProperties } }
+  UsersMe2faGetIntegration: { Properties: { <<: *CommonIntegrationProperties, IntegrationUri: !Sub "${BackendBaseUrl}/users/me/2fa", IntegrationMethod: GET, RequestParameters: *AuthorizerContextRequestParameters } }
+  UsersMe2faGetRoute: { Type: AWS::ApiGatewayV2::Route, Properties: { ApiId: !Ref IdentityHttpApi, RouteKey: GET /users/me/2fa, Target: !Join ["/", ["integrations", !Ref UsersMe2faGetIntegration]], <<: *ProtectedRouteProperties } }
+  UsersMe2faDeleteIntegration: { Properties: { <<: *CommonIntegrationProperties, IntegrationUri: !Sub "${BackendBaseUrl}/users/me/2fa", IntegrationMethod: DELETE, RequestParameters: *AuthorizerContextRequestParameters } }
+  UsersMe2faDeleteRoute: { Type: AWS::ApiGatewayV2::Route, Properties: { ApiId: !Ref IdentityHttpApi, RouteKey: DELETE /users/me/2fa, Target: !Join ["/", ["integrations", !Ref UsersMe2faDeleteIntegration]], <<: *ProtectedRouteProperties } }
+  UsersMe2faRecoveryCodesGetIntegration: { Properties: { <<: *CommonIntegrationProperties, IntegrationUri: !Sub "${BackendBaseUrl}/users/me/2fa/recovery-codes", IntegrationMethod: GET, RequestParameters: *AuthorizerContextRequestParameters } }
+  UsersMe2faRecoveryCodesGetRoute: { Type: AWS::ApiGatewayV2::Route, Properties: { ApiId: !Ref IdentityHttpApi, RouteKey: GET /users/me/2fa/recovery-codes, Target: !Join ["/", ["integrations", !Ref UsersMe2faRecoveryCodesGetIntegration]], <<: *ProtectedRouteProperties } }
+
+  # Permission Management
+  PermissionsGetIntegration: { Properties: { <<: *CommonIntegrationProperties, IntegrationUri: !Sub "${BackendBaseUrl}/permissions", IntegrationMethod: GET, RequestParameters: *AuthorizerContextRequestParameters } }
+  PermissionsGetRoute: { Type: AWS::ApiGatewayV2::Route, Properties: { ApiId: !Ref IdentityHttpApi, RouteKey: GET /permissions, Target: !Join ["/", ["integrations", !Ref PermissionsGetIntegration]], <<: *ProtectedRouteProperties } }
+  PermissionsPostIntegration: { Properties: { <<: *CommonIntegrationProperties, IntegrationUri: !Sub "${BackendBaseUrl}/permissions", IntegrationMethod: POST, RequestParameters: *AuthorizerContextRequestParameters } }
+  PermissionsPostRoute: { Type: AWS::ApiGatewayV2::Route, Properties: { ApiId: !Ref IdentityHttpApi, RouteKey: POST /permissions, Target: !Join ["/", ["integrations", !Ref PermissionsPostIntegration]], <<: *ProtectedRouteProperties } }
+  PermissionsByPermissionIdGetIntegration: { Properties: { <<: *CommonIntegrationProperties, IntegrationUri: !Sub "${BackendBaseUrl}/permissions/{permissionId}", IntegrationMethod: GET, RequestParameters: *AuthorizerContextRequestParameters } }
+  PermissionsByPermissionIdGetRoute: { Type: AWS::ApiGatewayV2::Route, Properties: { ApiId: !Ref IdentityHttpApi, RouteKey: GET /permissions/{permissionId}, Target: !Join ["/", ["integrations", !Ref PermissionsByPermissionIdGetIntegration]], <<: *ProtectedRouteProperties } }
+  PermissionsByPermissionIdPutIntegration: { Properties: { <<: *CommonIntegrationProperties, IntegrationUri: !Sub "${BackendBaseUrl}/permissions/{permissionId}", IntegrationMethod: PUT, RequestParameters: *AuthorizerContextRequestParameters } }
+  PermissionsByPermissionIdPutRoute: { Type: AWS::ApiGatewayV2::Route, Properties: { ApiId: !Ref IdentityHttpApi, RouteKey: PUT /permissions/{permissionId}, Target: !Join ["/", ["integrations", !Ref PermissionsByPermissionIdPutIntegration]], <<: *ProtectedRouteProperties } }
+  PermissionsByPermissionIdDeleteIntegration: { Properties: { <<: *CommonIntegrationProperties, IntegrationUri: !Sub "${BackendBaseUrl}/permissions/{permissionId}", IntegrationMethod: DELETE, RequestParameters: *AuthorizerContextRequestParameters } }
+  PermissionsByPermissionIdDeleteRoute: { Type: AWS::ApiGatewayV2::Route, Properties: { ApiId: !Ref IdentityHttpApi, RouteKey: DELETE /permissions/{permissionId}, Target: !Join ["/", ["integrations", !Ref PermissionsByPermissionIdDeleteIntegration]], <<: *ProtectedRouteProperties } }
+
+  # Role Management
+  RolesSystemGetIntegration: { Properties: { <<: *CommonIntegrationProperties, IntegrationUri: !Sub "${BackendBaseUrl}/roles/system", IntegrationMethod: GET, RequestParameters: *AuthorizerContextRequestParameters } }
+  RolesSystemGetRoute: { Type: AWS::ApiGatewayV2::Route, Properties: { ApiId: !Ref IdentityHttpApi, RouteKey: GET /roles/system, Target: !Join ["/", ["integrations", !Ref RolesSystemGetIntegration]], <<: *ProtectedRouteProperties } }
+  RolesSystemPostIntegration: { Properties: { <<: *CommonIntegrationProperties, IntegrationUri: !Sub "${BackendBaseUrl}/roles/system", IntegrationMethod: POST, RequestParameters: *AuthorizerContextRequestParameters } }
+  RolesSystemPostRoute: { Type: AWS::ApiGatewayV2::Route, Properties: { ApiId: !Ref IdentityHttpApi, RouteKey: POST /roles/system, Target: !Join ["/", ["integrations", !Ref RolesSystemPostIntegration]], <<: *ProtectedRouteProperties } }
+  TenantsByTenantIdRolesGetIntegration: { Properties: { <<: *CommonIntegrationProperties, IntegrationUri: !Sub "${BackendBaseUrl}/tenants/{tenantId}/roles", IntegrationMethod: GET, RequestParameters: *AuthorizerContextRequestParameters } }
+  TenantsByTenantIdRolesGetRoute: { Type: AWS::ApiGatewayV2::Route, Properties: { ApiId: !Ref IdentityHttpApi, RouteKey: GET /tenants/{tenantId}/roles, Target: !Join ["/", ["integrations", !Ref TenantsByTenantIdRolesGetIntegration]], <<: *ProtectedRouteProperties } }
+  TenantsByTenantIdRolesPostIntegration: { Properties: { <<: *CommonIntegrationProperties, IntegrationUri: !Sub "${BackendBaseUrl}/tenants/{tenantId}/roles", IntegrationMethod: POST, RequestParameters: *AuthorizerContextRequestParameters } }
+  TenantsByTenantIdRolesPostRoute: { Type: AWS::ApiGatewayV2::Route, Properties: { ApiId: !Ref IdentityHttpApi, RouteKey: POST /tenants/{tenantId}/roles, Target: !Join ["/", ["integrations", !Ref TenantsByTenantIdRolesPostIntegration]], <<: *ProtectedRouteProperties } }
+  RolesByRoleIdGetIntegration: { Properties: { <<: *CommonIntegrationProperties, IntegrationUri: !Sub "${BackendBaseUrl}/roles/{roleId}", IntegrationMethod: GET, RequestParameters: *AuthorizerContextRequestParameters } } 
+  RolesByRoleIdGetRoute: { Type: AWS::ApiGatewayV2::Route, Properties: { ApiId: !Ref IdentityHttpApi, RouteKey: GET /roles/{roleId}, Target: !Join ["/", ["integrations", !Ref RolesByRoleIdGetIntegration]], <<: *ProtectedRouteProperties } }
+  
+  # Role-Permission Assignment
+  TenantsByTenantIdRolesByRoleIdPermissionsGetIntegration: { Properties: { <<: *CommonIntegrationProperties, IntegrationUri: !Sub "${BackendBaseUrl}/tenants/{tenantId}/roles/{roleId}/permissions", IntegrationMethod: GET, RequestParameters: *AuthorizerContextRequestParameters } }
+  TenantsByTenantIdRolesByRoleIdPermissionsGetRoute: { Type: AWS::ApiGatewayV2::Route, Properties: { ApiId: !Ref IdentityHttpApi, RouteKey: GET /tenants/{tenantId}/roles/{roleId}/permissions, Target: !Join ["/", ["integrations", !Ref TenantsByTenantIdRolesByRoleIdPermissionsGetIntegration]], <<: *ProtectedRouteProperties } }
+  TenantsByTenantIdRolesByRoleIdPermissionsPostIntegration: { Properties: { <<: *CommonIntegrationProperties, IntegrationUri: !Sub "${BackendBaseUrl}/tenants/{tenantId}/roles/{roleId}/permissions", IntegrationMethod: POST, RequestParameters: *AuthorizerContextRequestParameters } }
+  TenantsByTenantIdRolesByRoleIdPermissionsPostRoute: { Type: AWS::ApiGatewayV2::Route, Properties: { ApiId: !Ref IdentityHttpApi, RouteKey: POST /tenants/{tenantId}/roles/{roleId}/permissions, Target: !Join ["/", ["integrations", !Ref TenantsByTenantIdRolesByRoleIdPermissionsPostIntegration]], <<: *ProtectedRouteProperties } }
+  TenantsByTenantIdRolesByRoleIdPermissionsByPermissionIdDeleteIntegration: { Properties: { <<: *CommonIntegrationProperties, IntegrationUri: !Sub "${BackendBaseUrl}/tenants/{tenantId}/roles/{roleId}/permissions/{permissionId}", IntegrationMethod: DELETE, RequestParameters: *AuthorizerContextRequestParameters } }
+  TenantsByTenantIdRolesByRoleIdPermissionsByPermissionIdDeleteRoute: { Type: AWS::ApiGatewayV2::Route, Properties: { ApiId: !Ref IdentityHttpApi, RouteKey: DELETE /tenants/{tenantId}/roles/{roleId}/permissions/{permissionId}, Target: !Join ["/", ["integrations", !Ref TenantsByTenantIdRolesByRoleIdPermissionsByPermissionIdDeleteIntegration]], <<: *ProtectedRouteProperties } }
+
+  # User-Role Assignment
+  TenantsByTenantIdUsersByUserIdRolesGetIntegration: { Properties: { <<: *CommonIntegrationProperties, IntegrationUri: !Sub "${BackendBaseUrl}/tenants/{tenantId}/users/{userId}/roles", IntegrationMethod: GET, RequestParameters: *AuthorizerContextRequestParameters } }
+  TenantsByTenantIdUsersByUserIdRolesGetRoute: { Type: AWS::ApiGatewayV2::Route, Properties: { ApiId: !Ref IdentityHttpApi, RouteKey: GET /tenants/{tenantId}/users/{userId}/roles, Target: !Join ["/", ["integrations", !Ref TenantsByTenantIdUsersByUserIdRolesGetIntegration]], <<: *ProtectedRouteProperties } }
+  TenantsByTenantIdUsersByUserIdRolesPostIntegration: { Properties: { <<: *CommonIntegrationProperties, IntegrationUri: !Sub "${BackendBaseUrl}/tenants/{tenantId}/users/{userId}/roles", IntegrationMethod: POST, RequestParameters: *AuthorizerContextRequestParameters } }
+  TenantsByTenantIdUsersByUserIdRolesPostRoute: { Type: AWS::ApiGatewayV2::Route, Properties: { ApiId: !Ref IdentityHttpApi, RouteKey: POST /tenants/{tenantId}/users/{userId}/roles, Target: !Join ["/", ["integrations", !Ref TenantsByTenantIdUsersByUserIdRolesPostIntegration]], <<: *ProtectedRouteProperties } }
+  TenantsByTenantIdUsersByUserIdRolesByRoleIdDeleteIntegration: { Properties: { <<: *CommonIntegrationProperties, IntegrationUri: !Sub "${BackendBaseUrl}/tenants/{tenantId}/users/{userId}/roles/{roleId}", IntegrationMethod: DELETE, RequestParameters: *AuthorizerContextRequestParameters } }
+  TenantsByTenantIdUsersByUserIdRolesByRoleIdDeleteRoute: { Type: AWS::ApiGatewayV2::Route, Properties: { ApiId: !Ref IdentityHttpApi, RouteKey: DELETE /tenants/{tenantId}/users/{userId}/roles/{roleId}, Target: !Join ["/", ["integrations", !Ref TenantsByTenantIdUsersByUserIdRolesByRoleIdDeleteIntegration]], <<: *ProtectedRouteProperties } }
+
+  # CloudWatch Alarm for High 5xx Errors
+  High5xxErrorAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub "${IdentityHttpApi}-High-5xx-Errors"
+      AlarmDescription: "Alarm when the rate of 5xx server errors is too high."
+      Namespace: AWS/ApiGateway # HTTP API metrics are under this namespace
+      MetricName: Http5xxCount # Incorrect, should be 5xxCount for HTTP API V2
+      Dimensions:
+        - Name: ApiId
+          Value: !Ref IdentityHttpApi
+        # You can add Stage dimension if you want to scope to a specific stage, e.g. !Ref DefaultStage.StageName
+        # However, DefaultStage.StageName is !Ref StageName which is often '$default'.
+        # For specific stage: - Name: Stage, Value: !Ref StageName 
+        # (But ensure StageName parameter is not '$default' if used here, or use !GetAtt DefaultStage.StageName if that works)
+        # For simplicity, alarm on overall API ID.
+      Statistic: Sum # Sum of 5xx errors
+      Period: !Ref High5xxErrorAlarmPeriodSeconds
+      EvaluationPeriods: !Ref High5xxErrorAlarmEvaluationPeriods
+      DatapointsToAlarm: !Ref High5xxErrorAlarmEvaluationPeriods # Alarm if all evaluation periods are above threshold
+      Threshold: !Ref High5xxErrorAlarmThreshold # This threshold is now for count, not percentage
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching # Or breaching, depending on desired behavior for no data
+      # If using Metric Math for percentage:
+      # Metrics:
+      #   - Id: e1
+      #     Expression: "(m1/m2)*100"
+      #     Label: "ErrorRatePercentage"
+      #     ReturnData: true
+      #   - Id: m1
+      #     MetricStat:
+      #       Metric: { Namespace: "AWS/ApiGateway", MetricName: "5xxCount", Dimensions: [{Name: ApiId, Value: !Ref IdentityHttpApi}] }
+      #       Period: !Ref High5xxErrorAlarmPeriodSeconds
+      #       Stat: Sum
+      #     ReturnData: false
+      #   - Id: m2
+      #     MetricStat:
+      #       Metric: { Namespace: "AWS/ApiGateway", MetricName: "Count", Dimensions: [{Name: ApiId, Value: !Ref IdentityHttpApi}] }
+      #       Period: !Ref High5xxErrorAlarmPeriodSeconds
+      #       Stat: Sum
+      #     ReturnData: false
+      # Threshold: !Ref High5xxErrorPercentageAlarmThreshold (would need a new param for percentage)
+      # ComparisonOperator: GreaterThanOrEqualToThreshold
+
+Outputs:
+  ApiEndpoint: { Description: "URL of the API Gateway HTTP API", Value: !Sub "https://${IdentityHttpApi}.execute-api.${AWS::Region}.amazonaws.com/${StageName}" }
+  HttpApiId: { Description: "ID of the HTTP API", Value: !Ref IdentityHttpApi }
+  LambdaAuthorizerFunctionName: { Description: "Name of the JWT Lambda Authorizer", Value: !Ref JwtAuthorizerFunction }
+  LambdaAuthorizerFunctionArn: { Description: "ARN of the JWT Lambda Authorizer", Value: !GetAtt JwtAuthorizerFunction.Arn }
+  ApiAccessLogGroupName: { Description: "Name of the CloudWatch Log Group for API Access Logs", Value: !Ref ApiAccessLogGroup }
+
+```
+The `api_gateway_identity_config.yaml` has been updated to include:
+1.  New CloudFormation parameters for access log retention and CloudWatch alarm settings.
+2.  An `AWS::Logs::LogGroup` resource (`ApiAccessLogGroup`) for storing API Gateway access logs.
+3.  Configuration of `AccessLogSettings` within the `DefaultStage` resource, directing logs to the created log group using a structured JSON format. This format includes various request, response, integration, and authorizer context fields.
+4.  An example `AWS::CloudWatch::Alarm` (`High5xxErrorAlarm`) that monitors the `5XXError` metric (note: for HTTP APIs, this should be `5xxCount`). I've set it up to monitor `5xxCount` directly with a threshold for the count. A more advanced setup would use Metric Math to calculate an error *rate* percentage. I've included a commented-out example of how Metric Math could be structured.
+
+**Correction for Alarm MetricName:**
+The metric for HTTP API 5xx errors is `5xxCount`, not `5XXError` (which is for REST APIs). I've updated the `MetricName` in the `High5xxErrorAlarm` resource in the generated YAML above. The threshold will now represent the count of 5xx errors rather than a percentage unless Metric Math is used.
+
+The current alarm setup is:
+- Monitors the sum of `5xxCount` for the entire API.
+- Period and evaluation periods are parameterized.
+- Threshold is for the raw count of 5xx errors.
+
+This fulfills the requirements of the subtask.

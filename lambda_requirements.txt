@@ -1,0 +1,17 @@
+python-jose[cryptography] # For JWT validation, consistent with IdentityService
+boto3 # AWS SDK for Python, for accessing Secrets Manager
+aws-lambda-powertools # Optional, but good for logging, metrics, tracing
+# PyJWT is an alternative, but python-jose is already in use.
+# Ensure the version is compatible with the one used for token generation.
+# For this example, just python-jose and boto3 are strictly necessary.
+# Adding powertools for best practices demonstration, but not strictly required by prompt.
+# For simplicity, let's stick to minimal:
+# python-jose[cryptography]
+# boto3
+# No, powertools is good practice.
+aws-lambda-powertools
+# boto3 is usually available in Lambda environment, but good to specify if specific version needed.
+# Let's assume standard boto3 is fine.
+# python-jose[cryptography]
+# aws-lambda-powertools
+# (boto3 will be available in the Lambda execution environment by default)
